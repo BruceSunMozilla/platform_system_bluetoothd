@@ -15,7 +15,6 @@
  */
 
 #include <assert.h>
-#include <errno.h>
 #include <fdio/task.h>
 #include <fdio/timer.h>
 #include <hardware/bluetooth.h>
@@ -147,6 +146,10 @@ align_properties(bt_property_t* properties, size_t num_properties,
   siz = sizeof(**aligned_properties) * num_properties;
 
   *aligned_properties = malloc(siz);
+  if (!*aligned_properties) {
+    ALOGE_ERRNO("malloc");
+    return NULL;
+  }
   memcpy(*aligned_properties, properties, siz);
 
   return *aligned_properties;
@@ -161,6 +164,8 @@ adapter_properties_cb(bt_status_t status, int num_properties,
 
   properties = align_properties(properties, num_properties,
                                 &aligned_properties);
+  if (!properties)
+    return;
 
   wbuf = create_pdu_wbuf(1 + /* status */
                          1 + /* number of properties */
@@ -202,6 +207,8 @@ remote_device_properties_cb(bt_status_t status,
 
   properties = align_properties(properties, num_properties,
                                 &aligned_properties);
+  if (!properties)
+    return;
 
   wbuf = create_pdu_wbuf(1 + /* status */
                          6 + /* address */
@@ -241,6 +248,8 @@ device_found_cb(int num_properties, bt_property_t* properties)
 
   properties = align_properties(properties, num_properties,
                                 &aligned_properties);
+  if (!properties)
+    return;
 
   wbuf = create_pdu_wbuf(1 + /* number of properties */
                          properties_length(num_properties, properties),
@@ -472,7 +481,11 @@ energy_info_cb(bt_activity_energy_info *energy_info ATTRIBS(UNUSED))
   /* nothing to do */
 }
 
-struct alarm_state {
+struct wake_alarm_param {
+  struct fd_events evfuncs;
+  int clockid;
+  unsigned long long timeout_ms;
+  unsigned long long interval_ms;
   alarm_cb cb;
   void* data;
 };
@@ -480,58 +493,65 @@ struct alarm_state {
 static enum ioresult
 alarm_event_in(int fd, void* data)
 {
-  uint64_t num_expirations;
-  ssize_t res;
+  struct wake_alarm_param* param = data;
 
-  struct alarm_state* alarm_state = data;
-  assert(alarm_state);
-  if (alarm_state->cb)
-    alarm_state->cb(alarm_state->data);
+  assert(param);
 
-  remove_timer(fd);
-  free(data);
-  return IO_OK;
+  if (param->cb)
+    param->cb(param->data);
+
+  remove_fd_from_epoll_loop(fd);
+  if (TEMP_FAILURE_RETRY(close(fd)) < 0)
+    ALOGW_ERRNO("close");
+  free(param);
+
+  return IO_POLL;
 }
 
 static enum ioresult
-alarm_event(int fd, uint32_t events, void* data)
+set_wake_alarm_task_cb(void* data)
 {
-  enum ioresult res;
+  struct wake_alarm_param* param = data;
 
-  if (events & EPOLLIN) {
-    res = alarm_event_in(fd, data);
-  } else {
-    ALOGW("unsupported event mask: %u", events);
-    res = IO_OK;
-  }
-  return res;
+  assert(param);
+
+  if (add_relative_timer_to_epoll_loop(param->clockid, param->timeout_ms,
+                                       param->interval_ms, fd_events_handler,
+                                       &param->evfuncs) < 0)
+    goto err_add_relative_timer_to_epoll_loop;
+
+  return IO_OK;
+err_add_relative_timer_to_epoll_loop:
+  free(param);
+  return IO_OK;
 }
 
 static bool
 set_wake_alarm_cb(uint64_t delay_millis, bool should_wake, alarm_cb cb,
                   void* data)
 {
-  struct alarm_state* alarm_state;
-  int clockid;
+  struct wake_alarm_param* param;
 
-  errno = 0;
-  alarm_state = malloc(sizeof(*alarm_state));
-  if (errno) {
+  param = malloc(sizeof(*param));
+  if (!param) {
     ALOGE_ERRNO("malloc");
     return false;
   }
+  memset(&param->evfuncs, 0, sizeof(param->evfuncs));
+  param->evfuncs.data = param;
+  param->evfuncs.epollin = alarm_event_in;
+  param->clockid = should_wake ? CLOCK_BOOTTIME_ALARM : CLOCK_BOOTTIME;
+  param->timeout_ms = delay_millis;
+  param->interval_ms = 0;
+  param->cb = cb;
+  param->data = data;
 
-  alarm_state->cb = cb;
-  alarm_state->data = data;
-
-  clockid = should_wake ? CLOCK_BOOTTIME_ALARM : CLOCK_BOOTTIME;
-  if (add_relative_timer_to_epoll_loop(clockid, delay_millis, 0, alarm_event,
-                                       alarm_state) < 0)
-    goto err_add_timer_to_epoll_loop;
+  if (run_task(set_wake_alarm_task_cb, param) < 0)
+    goto err_run_task;
 
   return true;
-err_add_timer_to_epoll_loop:
-  free(alarm_state);
+err_run_task:
+  free(param);
   return false;
 }
 
